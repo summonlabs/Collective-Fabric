@@ -91,6 +91,15 @@ int main() {
   std::vector<std::uint8_t> payload(w.data().begin(), w.data().end());
   CF_CHECK_THROWS(Store::decode(payload));
 
+  // ---- regression: duplicate backend ids are rejected like other duplicate ids ----
+  auto oneb = s;
+  PersistedBackend pb; pb.id = BackendId(1); pb.generation = BackendGeneration(1); pb.name = "reference";
+  oneb.backends.push_back(pb);
+  CF_CHECK_NO_THROW(Store::decode(Store::encode(oneb)));
+  auto dupb = oneb;
+  dupb.backends.push_back(pb);
+  CF_CHECK_THROWS(Store::decode(Store::encode(dupb)));
+
   remove(path); remove("trunc.bin"); remove("corrupt.bin"); remove("badmagic.bin"); remove("trailing.bin");
   CF_FINISH("test_persistence");
 }

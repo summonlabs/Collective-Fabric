@@ -120,17 +120,26 @@ public:
   GroupBuilder& lifecycle(GroupLifecycle l) { lifecycle_ = l; return *this; }
   GroupBuilder& provenance(Source s) { provenance_ = std::move(s); return *this; }
 
-  // Explicit rank; otherwise ranks assigned deterministically at build time.
+  // No rank given: ranks are assigned deterministically at build time.
   GroupBuilder& add_participant(ParticipantId id, WorkerId worker, WorkerBootId boot, NodeId node,
-                                DeviceId device, BackendGeneration backend_gen, RankId rank = RankId{}) {
+                                DeviceId device, BackendGeneration backend_gen) {
+    participants_.push_back(Participant{id, worker, boot, node, device, RankId{}, backend_gen, true});
+    explicit_rank_.push_back(false);
+    return *this;
+  }
+  // Explicit rank. RankId(0) is a real rank (the first one), so whether a rank
+  // was given is recorded here and never inferred from the rank value.
+  GroupBuilder& add_participant(ParticipantId id, WorkerId worker, WorkerBootId boot, NodeId node,
+                                DeviceId device, BackendGeneration backend_gen, RankId rank) {
     participants_.push_back(Participant{id, worker, boot, node, device, rank, backend_gen, true});
+    explicit_rank_.push_back(true);
     return *this;
   }
 
   // Build and validate. Throws Error(VALIDATION) on any invalid structure.
   CollectiveGroup build() {
     // Deterministic dense rank assignment.
-    if (std::any_of(participants_.begin(), participants_.end(), [](const Participant& p) { return p.rank.is_null(); })) {
+    if (!std::all_of(explicit_rank_.begin(), explicit_rank_.end(), [](bool given) { return given; })) {
       // not all explicitly ranked: assign by sorted participant id
       std::vector<Participant> sorted = participants_;
       std::sort(sorted.begin(), sorted.end(), [](const Participant& a, const Participant& b) { return a.id < b.id; });
@@ -178,6 +187,7 @@ private:
   GroupLifecycle lifecycle_ = GroupLifecycle::CREATING;
   Source provenance_;
   std::vector<Participant> participants_;
+  std::vector<bool> explicit_rank_;  // one entry per add_participant call
 };
 
 } // namespace collectivefabric

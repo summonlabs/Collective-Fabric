@@ -177,6 +177,7 @@ PersistentState Store::decode(std::span<const std::uint8_t> payload) {
   }
 
   if (!r.u64(bcount) || bcount > kMaxCount) throw Error(ErrorCode::DECODE, "store: invalid backend count");
+  std::unordered_set<BackendId> bid_seen;
   for (std::uint64_t i = 0; i < bcount; ++i) {
     PersistedBackend b;
     std::uint64_t v;
@@ -185,6 +186,7 @@ PersistentState Store::decode(std::span<const std::uint8_t> payload) {
     if (!r.u64(v)) throw Error(ErrorCode::DECODE, "store: truncated backend gen");
     b.generation = make_generation<BackendGenerationTag>(v);
     if (!r.string(b.name)) throw Error(ErrorCode::DECODE, "store: truncated backend name");
+    if (!bid_seen.insert(b.id).second) throw Error(ErrorCode::DECODE, "store: duplicate backend id");
     s.backends.push_back(b);
   }
   if (!r.u64(s.policy_count)) throw Error(ErrorCode::DECODE, "store: truncated policy count");

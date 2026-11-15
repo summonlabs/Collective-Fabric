@@ -98,6 +98,16 @@ int main(int argc, char** argv) {
   expect(wait_for(log, "PHASE_ALLREDUCE_DONE gen=2", 8), "fresh post-restart all-reduce (gen 2)");
   expect(wait_for(log, "PHASE_SAVED_FINAL", 8), "final authoritative state persisted");
   expect(wait_for(log, "PHASE_DONE", 8), "coordinator closure completed");
+  // The post-restart collective must really have run on the re-formed group:
+  // generation 2 is the survivor (boot 200) plus the restarted worker (boot
+  // 300), never the lost worker (boot 100), and it produced the reference sum.
+  expect(file_has(log, "COORD REGEN GROUP_ACCEPT boot=200 rank=0"), "survivor is rank 0 of group generation 2");
+  expect(file_has(log, "COORD REGEN GROUP_ACCEPT boot=300 rank=1"), "restarted worker is rank 1 of group generation 2");
+  expect(!file_has(log, "COORD REGEN GROUP_ACCEPT boot=100"), "lost worker is not a member of group generation 2");
+  expect(file_has(log, "PHASE_ALLREDUCE2 rank=0 contribution bytes=16"), "gen-2 rank 0 contributed");
+  expect(file_has(log, "PHASE_ALLREDUCE2 rank=1 contribution bytes=16"), "gen-2 rank 1 contributed");
+  expect(file_has(log, "PHASE_ALLREDUCE2 DONE sum=11.000000"), "gen-2 all-reduce produced the reference sum");
+  expect(!file_has(log, "PHASE_ALLREDUCE2 LOSS_DETECTED"), "gen-2 all-reduce lost no member");
 
   workerA2.kill();
   workerB.kill();
@@ -109,6 +119,9 @@ int main(int argc, char** argv) {
   Proc workerA3, workerB3;
   workerA3.launch("\"" + worker + "\" --port " + port + " --name A3 --boot 400 --stall-after 999");
   workerB3.launch("\"" + worker + "\" --port " + port + " --name B3 --boot 500 --stall-after 999");
+  // The persisted final state holds both group generations, both measurements
+  // and the epoch reached after the loss.
+  expect(wait_for(log + ".recover", "RECOVERY loaded groups=2 measurements=2 epoch=2", 10), "final state persisted both generations at epoch 2");
   expect(wait_for(log + ".recover", "RECOVERY_MEASUREMENTS_REVALIDATION_REQUIRED", 10), "recovered measurements require revalidation");
   expect(wait_for(log + ".recover", "RECOVERY_AUTHORITY_CLEARED", 10), "recovered live authority cleared");
   expect(wait_for(log + ".recover", "RECOVERY_ALLREDUCE_DONE", 10), "post-recovery collective executed");

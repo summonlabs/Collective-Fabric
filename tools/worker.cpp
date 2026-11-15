@@ -37,6 +37,19 @@ int run_worker(const Args& a, std::uint64_t boot, std::uint64_t stall_after) {
     printf("WORKER barrier done\n"); fflush(stdout);
   }
 
+  // The coordinator re-forms the group after a member is lost: the survivor
+  // adopts its rank in the new generation; any collective in flight is abandoned.
+  auto adopt_group = [&](const Frame& accept) -> bool {
+    CanonicalReader gr(accept.payload);
+    std::uint64_t nrank, ncount, ngroup, ngen;
+    if (!(gr.u64(nrank) && gr.u64(ncount) && gr.u64(ngroup) && gr.u64(ngen))) return false;
+    rank = nrank; rank_count = ncount; group_id = ngroup; group_gen = ngen;
+    printf("WORKER regroup boot=%llu rank=%llu gen=%llu\n", (unsigned long long)boot, (unsigned long long)rank,
+           (unsigned long long)group_gen);
+    fflush(stdout);
+    return true;
+  };
+
   int collective_index = 0;
   while (true) {
     Frame in;
@@ -60,7 +73,7 @@ int run_worker(const Args& a, std::uint64_t boot, std::uint64_t stall_after) {
       static const float v1[4] = {10,20,30,40};
       const float* base = (rank == 0) ? v0 : v1;
       std::vector<std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(base), reinterpret_cast<const std::uint8_t*>(base + d.element_count));
-      AuthClaim auth; auth.epoch = 1; auth.boot = boot; auth.group_gen = d.group_gen; auth.collective_gen = d.collective_gen;
+      AuthClaim auth; auth.epoch = d.epoch; auth.boot = boot; auth.group_gen = d.group_gen; auth.collective_gen = d.collective_gen;
       auth.attempt_gen = d.attempt_gen; auth.dispatch_gen = d.dispatch_gen;
       Frame con; con.kind = ProtocolMessageKind::CONTRIBUTION;
       con.payload = enc_blob(auth, bytes);
@@ -70,6 +83,11 @@ int run_worker(const Args& a, std::uint64_t boot, std::uint64_t stall_after) {
       ++collective_index;
       Frame res;
       if (!ch.recv(res, reason)) { printf("WORKER result recv failed %s\n", reason.c_str()); return 1; }
+      if (res.kind == ProtocolMessageKind::GROUP_ACCEPT) {
+        // No result will come: the collective was abandoned and the group re-formed.
+        if (!adopt_group(res)) { printf("WORKER regroup decode failed\n"); return 1; }
+        continue;
+      }
       if (res.kind != ProtocolMessageKind::RESULT) { printf("WORKER expected RESULT\n"); return 1; }
       CanonicalReader rr(res.payload);
       AuthClaim ra; std::span<const std::uint8_t> blob;
@@ -79,6 +97,8 @@ int run_worker(const Args& a, std::uint64_t boot, std::uint64_t stall_after) {
       printf("WORKER result[0]=%f\n", rv[0]); fflush(stdout);
       Frame comp; comp.kind = ProtocolMessageKind::COMPLETE; comp.payload = enc_simple(1, 1);
       ch.send(comp);
+    } else if (in.kind == ProtocolMessageKind::GROUP_ACCEPT) {
+      if (!adopt_group(in)) { printf("WORKER regroup decode failed\n"); return 1; }
     } else if (in.kind == ProtocolMessageKind::COMPLETE) {
       printf("WORKER complete ack\n"); fflush(stdout);
     } else if (in.kind == ProtocolMessageKind::ERROR_MSG) {

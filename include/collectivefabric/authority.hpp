@@ -54,12 +54,17 @@ inline AuthorityDecision evaluate_authority(const AuthorityGroundTruth& truth, c
     return d;
   }
   if (truth.live_boot.is_null()) {
-    // No live incarnation yet; a claim is not yet attributable.
+    // No live incarnation yet; a claim is not yet attributable. Nothing holds
+    // authority, so no incarnation's claim can be current, fresh or a duplicate
+    // of a recorded completion (e.g. after recovery cleared live authority).
     if (claim.boot.is_null()) {
       d.verdict = AuthorityVerdict::INVALID;
       d.reason = "claim carries no boot identity";
       return d;
     }
+    d.verdict = AuthorityVerdict::UNKNOWN;
+    d.reason = "no live incarnation; claim is not attributable";
+    return d;
   }
 
   // 2. Coordinator epoch. A stale epoch is rejected even for a matching boot.

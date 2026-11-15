@@ -67,5 +67,30 @@ int main() {
   CF_CHECK(g8.generation().value() == 2);
   CF_CHECK(g8.digest() != g.digest());
 
+  // ---- regression: explicit ranks, including rank 0, are honored and validated ----
+  // Rank 0 is a real rank: an explicit assignment that differs from participant
+  // id order must be kept, not replaced by the id-ordered assignment.
+  auto g9 = GroupBuilder(CollectiveGroupId(9), GroupGeneration(1))
+    .membership_generation(MembershipGeneration(1)).topology_generation(TopologyGeneration(1))
+    .add_participant(ParticipantId(20), WorkerId(2), WorkerBootId(200), NodeId(1), DeviceId(2), BackendGeneration(1), RankId(0))
+    .add_participant(ParticipantId(10), WorkerId(1), WorkerBootId(100), NodeId(1), DeviceId(1), BackendGeneration(1), RankId(1)).build();
+  CF_CHECK(g9.participant_at(RankId(0))->id == ParticipantId(20));
+  CF_CHECK(g9.participant_at(RankId(1))->id == ParticipantId(10));
+  CF_CHECK(g9.rank_of(ParticipantId(10)) == RankId(1));
+
+  // duplicate explicit rank 0 rejected
+  GroupBuilder gb10(CollectiveGroupId(10), GroupGeneration(1));
+  gb10.membership_generation(MembershipGeneration(1)).topology_generation(TopologyGeneration(1));
+  gb10.add_participant(ParticipantId(1), WorkerId(1), WorkerBootId(100), NodeId(1), DeviceId(1), BackendGeneration(1), RankId(0));
+  gb10.add_participant(ParticipantId(2), WorkerId(2), WorkerBootId(200), NodeId(1), DeviceId(2), BackendGeneration(1), RankId(0));
+  CF_CHECK_THROWS(gb10.build());
+
+  // rank hole that starts at rank 0 rejected
+  GroupBuilder gb11(CollectiveGroupId(11), GroupGeneration(1));
+  gb11.membership_generation(MembershipGeneration(1)).topology_generation(TopologyGeneration(1));
+  gb11.add_participant(ParticipantId(1), WorkerId(1), WorkerBootId(100), NodeId(1), DeviceId(1), BackendGeneration(1), RankId(0));
+  gb11.add_participant(ParticipantId(2), WorkerId(2), WorkerBootId(200), NodeId(1), DeviceId(2), BackendGeneration(1), RankId(2));
+  CF_CHECK_THROWS(gb11.build());
+
   CF_FINISH("test_group_membership");
 }

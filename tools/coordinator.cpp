@@ -68,7 +68,7 @@ int run_coordinator(const Args& a) {
   Runtime rt;
   auto backend = std::make_shared<ReferenceBackend>(BackendId(1), BackendGeneration(1));
   rt.register_backend(backend);
-  rt.advance_epoch();  // epoch 1
+  // The runtime starts at coordinator epoch 1; it advances to 2 on the loss.
 
   // Topology (single-node, two devices; SYNTHETIC where not measured).
   Topology topo(TopologyGeneration(1));
@@ -126,57 +126,68 @@ int run_coordinator(const Args& a) {
   }
   logline("PHASE_BARRIER_DONE");
 
-  auto run_allreduce = [&](std::uint64_t gen, const std::string& label, bool expect_loss)->bool {
+  // DONE: the collective ran and every rank acknowledged the result.
+  // LOST: a member was lost; its channel is closed so it is dropped at regroup.
+  enum class Outcome { DONE, LOST, FAILED };
+  auto run_allreduce = [&](std::uint64_t gen, const std::string& label) -> Outcome {
     const std::uint64_t count = 4;
     Frame req; req.kind = ProtocolMessageKind::REQUEST_COLLECTIVE;
     Desc d; d.kind = (std::uint8_t)CollectiveKind::ALL_REDUCE; d.datatype = (std::uint8_t)Datatype::FLOAT32;
     d.reduction = (std::uint8_t)ReductionOp::SUM; d.element_count = count; d.root = 0; d.rank_count = 2;
-    d.group_id = group_id; d.group_gen = gen; d.collective_gen = 1; d.epoch = 2; d.attempt_gen = 1; d.dispatch_gen = 1;
-    if (expect_loss) { d.epoch = 1; d.dispatch_gen = 1; }
+    d.group_id = group_id; d.group_gen = gen; d.collective_gen = 1; d.epoch = rt.authority().epoch.value();
+    d.attempt_gen = 1; d.dispatch_gen = 1;
     req.payload = enc_desc(d);
     std::vector<std::vector<std::uint8_t>> inputs(2);
-    std::vector<AuthClaim> auths(2);
-    bool lost = false;
     for (auto& w : workers) {
       w.ch->send(req);
     }
-    for (int i = 0; i < 2; ++i) {
-      Frame f; std::string reason;
-      if (!workers[i].ch->recv(f, reason)) {
-        logline(label + " LOSS_DETECTED boot=" + std::to_string(workers[i].boot) + " reason=" + reason);
-        lost = true; break;
+    for (auto& w : workers) {
+      for (;;) {
+        Frame f; std::string reason;
+        if (!w.ch->recv(f, reason)) {
+          logline(label + " LOSS_DETECTED boot=" + std::to_string(w.boot) + " reason=" + reason);
+          w.ch->close();
+          return Outcome::LOST;
+        }
+        if (f.kind != ProtocolMessageKind::CONTRIBUTION) { logline(label + " expected CONTRIBUTION"); return Outcome::FAILED; }
+        CanonicalReader rr(f.payload); AuthClaim claim; std::span<const std::uint8_t> bytes;
+        if (!(rr.u64(claim.epoch) && rr.u64(claim.boot) && rr.u64(claim.group_gen) && rr.u64(claim.collective_gen) &&
+              rr.u64(claim.attempt_gen) && rr.u64(claim.dispatch_gen) && rr.bytes(bytes))) {
+          logline(label + " contribution blob decode failed"); return Outcome::FAILED;
+        }
+        // A contribution left over from a collective that was abandoned carries
+        // the authority of that collective: it is stale and is never reduced.
+        if (claim.boot != w.boot || claim.epoch != d.epoch || claim.group_gen != d.group_gen ||
+            claim.collective_gen != d.collective_gen || claim.attempt_gen != d.attempt_gen ||
+            claim.dispatch_gen != d.dispatch_gen) {
+          logline(label + " STALE_CONTRIBUTION_REJECTED boot=" + std::to_string(w.boot) +
+                  " epoch=" + std::to_string(claim.epoch) + " group_gen=" + std::to_string(claim.group_gen));
+          continue;
+        }
+        inputs[w.rank] = std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+        logline(label + " rank=" + std::to_string(w.rank) + " contribution bytes=" + std::to_string(inputs[w.rank].size()));
+        break;
       }
-      if (f.kind != ProtocolMessageKind::CONTRIBUTION) { logline(label + " expected CONTRIBUTION"); return false; }
-      CanonicalReader r(f.payload);
-      if (!dec_auth(f.payload, auths[i])) { logline(label + " contribution auth decode failed"); return false; }
-      // blob is the trailing field
-      std::span<const std::uint8_t> blob;
-      // re-read: skip auth fields then blob
-      CanonicalWriter dummy;
-      // parse blob
-      CanonicalReader rr(f.payload); AuthClaim tmp; std::span<const std::uint8_t> bytes;
-      if (!(rr.u64(tmp.epoch) && rr.u64(tmp.boot) && rr.u64(tmp.group_gen) && rr.u64(tmp.collective_gen) &&
-            rr.u64(tmp.attempt_gen) && rr.u64(tmp.dispatch_gen) && rr.bytes(bytes))) {
-        logline(label + " contribution blob decode failed"); return false;
-      }
-      inputs[i] = std::vector<std::uint8_t>(bytes.begin(), bytes.end());
-      logline(label + " rank=" + std::to_string(i) + " contribution bytes=" + std::to_string(inputs[i].size()));
     }
-    if (lost) return lost;
     std::vector<ReferenceEngine::Span> spans;
     for (auto& in : inputs) spans.push_back(ReferenceEngine::Span{in.data(), in.size()});
     std::vector<std::vector<std::uint8_t>> outputs;
     ReferenceEngine::execute(CollectiveKind::ALL_REDUCE, ReductionOp::SUM, Datatype::FLOAT32, count, 0, 2, spans, outputs);
     for (auto& w : workers) {
       Frame res; res.kind = ProtocolMessageKind::RESULT;
-      AuthClaim a; a.epoch = 2; a.boot = w.boot; a.group_gen = gen; a.collective_gen = 1; a.attempt_gen = 1; a.dispatch_gen = 1;
+      AuthClaim a; a.epoch = d.epoch; a.boot = w.boot; a.group_gen = gen; a.collective_gen = 1; a.attempt_gen = 1; a.dispatch_gen = 1;
       res.payload = enc_blob(a, outputs[0]);
       w.ch->send(res);
     }
     // wait COMPLETE acks
     for (auto& w : workers) {
       Frame f; std::string reason;
-      if (!w.ch->recv(f, reason)) { logline(label + " COMPLETE lost boot=" + std::to_string(w.boot) + " reason=" + reason); return lost; }
+      if (!w.ch->recv(f, reason)) {
+        logline(label + " COMPLETE lost boot=" + std::to_string(w.boot) + " reason=" + reason);
+        w.ch->close();
+        return Outcome::LOST;
+      }
+      if (f.kind != ProtocolMessageKind::COMPLETE) { logline(label + " expected COMPLETE"); return Outcome::FAILED; }
     }
     float s = ((float*)outputs[0].data())[0];
     logline(label + " DONE sum=" + std::to_string(s));
@@ -190,18 +201,19 @@ int run_coordinator(const Args& a) {
     m.freshness = MeasurementFreshness::CURRENT; m.timestamp_utc_ns = clock::wall_ns();
     m.measurement_generation = MeasurementGeneration(gen); m.source = make_source("host-staged tcp", ProvenanceKind::MEASURED);
     rt.ingest_measurement(m);
-    return false;
+    return Outcome::DONE;
   };
 
-  run_allreduce(1, "PHASE_ALLREDUCE", false);
+  if (run_allreduce(1, "PHASE_ALLREDUCE") != Outcome::DONE) { logline("COORD all-reduce gen=1 did not complete"); return 1; }
   logline("PHASE_ALLREDUCE_DONE gen=1");
 
   // ---- SAVE ---------------------------------------------------------------
   auto build_state = [&]() -> PersistentState {
     PersistentState s; s.saved_ns = clock::wall_ns();
     s.epoch = rt.authority().epoch; s.live_boot = rt.authority().live_boot;
-    // export groups
-    for (const auto& gk : std::vector<std::pair<CollectiveGroupId,GroupGeneration>>{{CollectiveGroupId(1), GroupGeneration(1)}}) {
+    // export every group generation formed so far (generation 2 exists after the regroup)
+    for (const auto& gk : std::vector<std::pair<CollectiveGroupId,GroupGeneration>>{
+             {CollectiveGroupId(group_id), GroupGeneration(1)}, {CollectiveGroupId(group_id), GroupGeneration(2)}}) {
       const auto* g = rt.find_group(gk.first, gk.second);
       if (!g) continue;
       PersistedGroup pg; pg.group_id = g->id(); pg.generation = g->generation();
@@ -233,7 +245,8 @@ int run_coordinator(const Args& a) {
 
   // ---- begin another collective with live authority; worker A will die ----
   logline("PHASE_BEGIN_LIVE_COLLECTIVE");
-  run_allreduce(1, "PHASE_LOSS", true);  // blocks; driver kills worker A
+  // blocks; driver kills worker A
+  if (run_allreduce(1, "PHASE_LOSS") != Outcome::LOST) { logline("COORD expected the loss of a worker"); return 1; }
   logline("PHASE_LOSS_DETECTED");
 
   // ---- reconfigure --------------------------------------------------------
@@ -242,7 +255,8 @@ int run_coordinator(const Args& a) {
     if (!it->ch || !it->ch->valid()) { logline("COORD dropping dead worker boot=" + std::to_string(it->boot)); it = workers.erase(it); }
     else ++it;
   }
-  logline("PHASE_RECONFIGURE epoch=2");
+  if (workers.size() != 1) { logline("COORD expected exactly one surviving worker"); return 1; }
+  logline("PHASE_RECONFIGURE epoch=" + std::to_string(rt.authority().epoch.value()));
 
   // ---- accept new worker A' (fresh boot) ----------------------------------
   {
@@ -250,16 +264,17 @@ int run_coordinator(const Args& a) {
     if (s == INVALID_SOCKET) { logline("COORD accept A' failed"); return 1; }
     auto ch = std::make_unique<FrameChannel>(s);
     Frame f; std::string reason;
-    ch->recv(f, reason);
-    if (f.kind != ProtocolMessageKind::HELLO) { logline("COORD expected HELLO from A'"); return 1; }
+    if (!ch->recv(f, reason) || f.kind != ProtocolMessageKind::HELLO) { logline("COORD expected HELLO from A'"); return 1; }
     CanonicalReader r(f.payload);
     std::uint64_t boot; std::string name;
-    r.u64(boot); r.string(name);
-    ch->recv(f, reason);
+    if (!r.u64(boot) || !r.string(name)) { logline("COORD HELLO decode failed for A'"); return 1; }
+    if (!ch->recv(f, reason) || f.kind != ProtocolMessageKind::JOIN_GROUP) { logline("COORD expected JOIN_GROUP from A'"); return 1; }
     WorkerState w; w.ch = std::move(ch); w.boot = boot; w.name = name; w.joined = true;
     workers.push_back(std::move(w));
     logline("COORD new worker boot=" + std::to_string(boot));
   }
+  // The group is re-formed from the survivor and the restarted worker; the lost
+  // worker was dropped above and is not a member of generation 2.
   form_group(rt, workers, group_id, 2, topo.generation());
   for (auto& w : workers) {
     auto g = rt.find_group(CollectiveGroupId(group_id), GroupGeneration(2));
@@ -268,6 +283,17 @@ int run_coordinator(const Args& a) {
     acc.payload = enc_rank_accept(rk.raw(), g->rank_count(), group_id, 2);
     w.ch->send(acc);
     logline("COORD REGEN GROUP_ACCEPT boot=" + std::to_string(w.boot) + " rank=" + std::to_string(rk.raw()));
+  }
+  // The newly joined worker runs its barrier under generation 2; the survivor
+  // adopts the new generation without one.
+  {
+    WorkerState& joined = workers.back();
+    Frame f; std::string reason;
+    if (!joined.ch->recv(f, reason) || f.kind != ProtocolMessageKind::BARRIER) { logline("COORD expected BARRIER from A'"); return 1; }
+    AuthClaim c;
+    if (!dec_auth(f.payload, c) || c.boot != joined.boot || c.group_gen != 2) { logline("COORD regroup barrier stale auth rejected"); return 1; }
+    Frame ack; ack.kind = ProtocolMessageKind::COMPLETE; ack.payload = enc_simple(1, 1);
+    joined.ch->send(ack);
   }
   rt.set_live_boot(WorkerBootId(workers[0].boot));  // representative live incarnation
   rt.authority().group_generation = GroupGeneration(2);
@@ -278,13 +304,8 @@ int run_coordinator(const Args& a) {
 
   // ---- stale replay -------------------------------------------------------
   {
-    AuthorityGroundTruth truth;
-    truth.epoch = CoordinatorEpoch(2);
-    truth.live_boot = WorkerBootId(workers[0].boot);
-    truth.group_generation = GroupGeneration(2);
-    truth.collective_generation = CollectiveGeneration(1);
-    truth.attempt_generation = AttemptGeneration(2);
-    truth.dispatch_generation = DispatchGeneration(2);
+    // The claims are judged against the runtime's own authority, not a copy.
+    const AuthorityGroundTruth truth = rt.authority();
     int rejected = 0, accepted = 0;
     auto check = [&](AuthorityClaim c) {
       auto d = evaluate_authority(truth, c);
@@ -316,7 +337,7 @@ int run_coordinator(const Args& a) {
   // ---- fresh collective on group gen 2 ------------------------------------
   st = build_state();
   Store::save(a.statefile + ".before2", st);
-  run_allreduce(2, "PHASE_ALLREDUCE2", false);
+  if (run_allreduce(2, "PHASE_ALLREDUCE2") != Outcome::DONE) { logline("COORD all-reduce gen=2 did not complete"); return 1; }
   logline("PHASE_ALLREDUCE_DONE gen=2");
 
   st = build_state();
@@ -350,7 +371,8 @@ int run_recover(const Args& a) {
     auto [state, loadres] = Store::load(a.statefile);
     (void)loadres;
     logline("RECOVERY loaded groups=" + std::to_string(state.groups.size()) +
-            " measurements=" + std::to_string(state.measurements.size()));
+            " measurements=" + std::to_string(state.measurements.size()) +
+            " epoch=" + std::to_string(state.epoch.value()));
     if (state.groups.empty()) { logline("RECOVERY_DONE"); return 1; }
     Runtime rt;
     auto backend = std::make_shared<ReferenceBackend>(BackendId(1), BackendGeneration(1));

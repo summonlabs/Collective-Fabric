@@ -67,5 +67,24 @@ int main() {
   stale_grp.attempt_generation = AttemptGeneration(4); stale_grp.dispatch_generation = DispatchGeneration(7);
   CF_CHECK(evaluate_authority(truth, stale_grp).verdict == AuthorityVerdict::STALE);
 
+  // ---- regression: with no live incarnation no claim is current ----
+  // After recovery clears live authority, a claim that matches every recorded
+  // generation is still not attributable to a live incarnation.
+  AuthorityGroundTruth cleared = truth;
+  cleared.live_boot = WorkerBootId{};
+  AuthorityClaim replay;
+  replay.boot = WorkerBootId(100); replay.epoch = CoordinatorEpoch(3);
+  replay.group_generation = GroupGeneration(5); replay.collective_generation = CollectiveGeneration(2);
+  replay.attempt_generation = AttemptGeneration(4); replay.dispatch_generation = DispatchGeneration(7);
+  CF_CHECK(evaluate_authority(cleared, replay).verdict == AuthorityVerdict::UNKNOWN);
+  replay.is_completion = true;
+  CF_CHECK(evaluate_authority(cleared, replay).verdict == AuthorityVerdict::UNKNOWN);
+  replay.is_completion = false;
+  replay.dispatch_generation = DispatchGeneration(8);  // newer than recorded
+  CF_CHECK(evaluate_authority(cleared, replay).verdict == AuthorityVerdict::UNKNOWN);
+  AuthorityClaim anonymous = replay;
+  anonymous.boot = WorkerBootId{};
+  CF_CHECK(evaluate_authority(cleared, anonymous).verdict == AuthorityVerdict::INVALID);
+
   CF_FINISH("test_identity");
 }

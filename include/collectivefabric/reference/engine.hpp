@@ -44,6 +44,7 @@ public:
     if (!need_total) throw Error(ErrorCode::ARITHMETIC_OVERFLOW, "reference engine: rank_count*per_bytes overflow");
     const std::size_t total_bytes = static_cast<std::size_t>(*need_total);
 
+    if (rank_count == 0) throw Error(ErrorCode::VALIDATION, "reference engine: collective has no ranks");
     outputs.assign(rank_count, std::vector<std::uint8_t>());
     switch (kind) {
       case CollectiveKind::BARRIER: barrier(outputs, rank_count); break;
@@ -64,6 +65,7 @@ private:
                         std::size_t per_bytes, std::uint64_t root_index,
                         std::uint64_t rank_count,
                         std::vector<std::vector<std::uint8_t>>& outputs) {
+    if (root_index >= rank_count) throw Error(ErrorCode::VALIDATION, "broadcast: root rank is not a rank of the collective");
     if (root_index >= inputs.size() || inputs[root_index].bytes != per_bytes) {
       throw Error(ErrorCode::VALIDATION, "broadcast: root input size mismatch");
     }
@@ -78,6 +80,7 @@ private:
                      std::uint64_t rank_count,
                      std::vector<std::vector<std::uint8_t>>& outputs) {
     checksize(inputs, per_bytes, rank_count);
+    if (root_index >= rank_count) throw Error(ErrorCode::VALIDATION, "reduce: root rank is not a rank of the collective");
     outputs[root_index].assign(per_bytes, 0);
     reduce_into(inputs, dt, op, per_bytes, rank_count, outputs[root_index].data());
   }
@@ -94,6 +97,7 @@ private:
   static void all_gather(const std::vector<Span>& inputs, std::size_t per_bytes,
                          std::uint64_t rank_count, std::size_t total_bytes,
                          std::vector<std::vector<std::uint8_t>>& outputs) {
+    if (inputs.size() < rank_count) throw Error(ErrorCode::VALIDATION, "all_gather: missing rank contribution");
     for (std::uint64_t r = 0; r < rank_count; ++r) {
       if (inputs[r].bytes != per_bytes) throw Error(ErrorCode::VALIDATION, "all_gather: rank input size mismatch");
       outputs[r].assign(total_bytes, 0);
@@ -109,6 +113,7 @@ private:
     auto total = checked_mul(per_bytes, rank_count);
     if (!total) throw Error(ErrorCode::ARITHMETIC_OVERFLOW, "reduce_scatter: overflow");
     const std::size_t total_bytes = static_cast<std::size_t>(*total);
+    if (inputs.size() < rank_count) throw Error(ErrorCode::VALIDATION, "reduce_scatter: missing rank contribution");
     for (std::uint64_t r = 0; r < rank_count; ++r)
       if (inputs[r].bytes != total_bytes) throw Error(ErrorCode::VALIDATION, "reduce_scatter: rank input size mismatch");
     for (std::uint64_t r = 0; r < rank_count; ++r) outputs[r].assign(per_bytes, 0);

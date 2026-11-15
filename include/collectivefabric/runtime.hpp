@@ -108,6 +108,10 @@ private:
     std::optional<MeasurementId> measurement;
     std::vector<std::vector<std::uint8_t>> outputs;
     CollectiveId collective_id;
+    // Accounting this execution still holds open: its reservation and slot in
+    // the active-collective gauge, and the rank contributions not yet reported.
+    bool accounting_open = false;
+    std::uint64_t pending_rank_contributions = 0;
   };
 
   Execution& require(ExecutionId e);
@@ -115,6 +119,9 @@ private:
   // Lock-free helpers; callers must already hold mu_.
   const CollectiveGroup* find_group_unlocked(CollectiveGroupId id, GroupGeneration gen) const noexcept;
   void apply_quorum_unlocked(Execution& ex);
+  // Closes the accounting an execution opened (reservation, active-collective
+  // slot, outstanding rank contributions) when it reaches a terminal state.
+  void close_accounting_unlocked(Execution& ex, bool aborted);
   std::uint64_t per_rank_bytes(const CollectiveDescriptor& d, std::uint64_t rank_count) const;
   std::uint64_t next_id_ = 1;
 

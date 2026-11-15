@@ -88,5 +88,20 @@ int main() {
   d.element_count(UINT64_MAX);
   CF_CHECK_THROWS(d.element_byte_count());  // overflow
 
+  // ---- regression: ranks and root are bounded before anything is indexed ----
+  // A broadcast root must be a rank of the collective even when more inputs
+  // than ranks are supplied.
+  std::vector<ReferenceEngine::Span> br3{{root.data(), root.size()}, {root.data(), root.size()}, {b0.data(), b0.size()}};
+  CF_CHECK_THROWS(ReferenceEngine::execute(CollectiveKind::BROADCAST, ReductionOp::NONE, Datatype::INT64, 2, 2, 2, br3, outputs));
+  CF_CHECK_NO_THROW(ReferenceEngine::execute(CollectiveKind::BROADCAST, ReductionOp::NONE, Datatype::INT64, 2, 1, 2, br3, outputs));
+  // A missing rank contribution is rejected for the gathering kinds too.
+  std::vector<ReferenceEngine::Span> one{{b0.data(), b0.size()}};
+  CF_CHECK_THROWS(ReferenceEngine::execute(CollectiveKind::ALL_GATHER, ReductionOp::NONE, Datatype::INT64, 2, 0, 2, one, outputs));
+  std::vector<ReferenceEngine::Span> one_rs{{c0.data(), c0.size()}};
+  CF_CHECK_THROWS(ReferenceEngine::execute(CollectiveKind::REDUCE_SCATTER, ReductionOp::SUM, Datatype::INT64, 2, 0, 2, one_rs, outputs));
+  // A reduce root outside the group and a collective without ranks are rejected.
+  CF_CHECK_THROWS(ReferenceEngine::execute(CollectiveKind::REDUCE, ReductionOp::SUM, Datatype::INT64, 2, 2, 2, is, outputs));
+  CF_CHECK_THROWS(ReferenceEngine::execute(CollectiveKind::ALL_REDUCE, ReductionOp::SUM, Datatype::INT64, 2, 0, 0, std::vector<ReferenceEngine::Span>{}, outputs));
+
   CF_FINISH("test_collective_semantics");
 }

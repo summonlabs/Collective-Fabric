@@ -96,6 +96,7 @@ ReservationId Runtime::reserve_collective(ExecutionId e) {
   ex.reservation = ReservationId(next_id_++);
   accounting_.reserve(ex.reservation, bytes);
   accounting_.collective_started();
+  ex.accounting_open = true;
   return ex.reservation;
 }
 
@@ -104,7 +105,21 @@ DispatchId Runtime::dispatch_collective(ExecutionId e) {
   auto& ex = require(e);
   ex.lifecycle.transition_to(CollectiveState::DISPATCHED);
   ex.dispatch = DispatchId(next_id_++);
+  // Every rank of the group now owes a contribution.
+  if (const auto* grp = find_group_unlocked(ex.descriptor.group_id(), ex.descriptor.group_generation())) {
+    for (std::size_t i = 0; i < grp->rank_count(); ++i) accounting_.active_rank_contribution();
+    ex.pending_rank_contributions = grp->rank_count();
+  }
   return ex.dispatch;
+}
+
+void Runtime::close_accounting_unlocked(Execution& ex, bool aborted) {
+  for (; ex.pending_rank_contributions > 0; --ex.pending_rank_contributions) accounting_.rank_contribution_complete();
+  if (!ex.accounting_open) return;
+  ex.accounting_open = false;
+  accounting_.release(ex.reservation);
+  if (aborted) accounting_.collective_aborted();
+  else accounting_.collective_completed();
 }
 
 std::uint64_t Runtime::per_rank_bytes(const CollectiveDescriptor& d, std::uint64_t rank_count) const {
@@ -122,6 +137,7 @@ MeasurementId Runtime::execute_collective(ExecutionId e, std::vector<std::vector
   std::vector<std::vector<std::uint8_t>> outputs;
   CollectiveFailure failure;
   bool ok = true;
+  bool started = false;  // this call moved the execution to RUNNING
   try {
     if (!grp) throw Error(ErrorCode::VALIDATION, "execute: group not found");
     if (inputs.size() < rank_count) throw Error(ErrorCode::VALIDATION, "execute: missing rank inputs");
@@ -135,6 +151,7 @@ MeasurementId Runtime::execute_collective(ExecutionId e, std::vector<std::vector
       std::lock_guard<std::mutex> l(mu_);
       auto& ex = require(e);
       ex.lifecycle.transition_to(CollectiveState::RUNNING);
+      started = true;
     }
     ReferenceEngine::execute(d->kind(), d->reduction(), d->datatype(), d->element_count(), root, rank_count, spans, outputs);
   } catch (const std::exception& err) {
@@ -153,9 +170,16 @@ MeasurementId Runtime::execute_collective(ExecutionId e, std::vector<std::vector
   std::lock_guard<std::mutex> l(mu_);
   auto& ex = require(e);
   if (!ok) {
-    try { ex.lifecycle.transition_to(CollectiveState::FAILED); } catch (const Error&) {}
+    // Only an execution this call started, or one that was not yet running, is
+    // failed. A collective that is running under another call or has already
+    // reached a terminal state keeps its outcome, failure record and accounting.
+    const CollectiveState st = ex.lifecycle.state();
+    const bool in_flight_elsewhere = !started && (st == CollectiveState::RUNNING || st == CollectiveState::COMPLETING);
+    if (in_flight_elsewhere || !ex.lifecycle.can_transition_to(CollectiveState::FAILED)) return MeasurementId{};
+    ex.lifecycle.transition_to(CollectiveState::FAILED);
     ex.failure = failure;
     accounting_.failed_bytes(d->element_byte_count());
+    close_accounting_unlocked(ex, false);
     return MeasurementId{};
   }
   for (std::uint64_t r = 0; r < rank_count; ++r) ex.rank_completions[RankId(r)] = true;
@@ -190,7 +214,6 @@ MeasurementId Runtime::execute_collective(ExecutionId e, std::vector<std::vector
   }
   measurements_[m.id] = m;
   ex.measurement = m.id;
-  accounting_.collective_completed();
   auto cb = checked_mul(m.payload_bytes, rank_count);
   accounting_.completed_bytes(cb ? *cb : 0);
   return m.id;
@@ -199,12 +222,23 @@ MeasurementId Runtime::execute_collective(ExecutionId e, std::vector<std::vector
 void Runtime::complete_rank(ExecutionId e, RankId r) {
   std::lock_guard<std::mutex> l(mu_);
   auto& ex = require(e);
+  // A completion is only accepted for a collective that is in flight and from a
+  // rank of its group; everything is checked before anything is recorded.
+  const CollectiveState st = ex.lifecycle.state();
+  if (st != CollectiveState::DISPATCHED && st != CollectiveState::RUNNING && st != CollectiveState::COMPLETING) {
+    throw Error(ErrorCode::LIFECYCLE, "rank completion for a collective that is not in flight");
+  }
+  const auto* grp = find_group_unlocked(ex.descriptor.group_id(), ex.descriptor.group_generation());
+  if (!grp || !grp->participant_at(r)) throw Error(ErrorCode::VALIDATION, "rank completion from a rank outside the group");
   if (ex.rank_completions.count(r)) throw Error(ErrorCode::CONFLICT, "duplicate rank completion");
   ex.rank_completions[r] = true;
-  accounting_.rank_contribution_complete();
-  if (ex.lifecycle.state() == CollectiveState::RUNNING) {
-    try { ex.lifecycle.transition_to(CollectiveState::COMPLETING); } catch (const Error&) {}
+  if (ex.pending_rank_contributions > 0) {
+    --ex.pending_rank_contributions;
+    accounting_.rank_contribution_complete();
   }
+  // The first completion report shows the dispatched collective is running.
+  if (ex.lifecycle.state() == CollectiveState::DISPATCHED) ex.lifecycle.transition_to(CollectiveState::RUNNING);
+  if (ex.lifecycle.state() == CollectiveState::RUNNING) ex.lifecycle.transition_to(CollectiveState::COMPLETING);
   apply_quorum_unlocked(ex);
 }
 
@@ -217,19 +251,23 @@ void Runtime::fail_collective(ExecutionId e, CollectiveFailure f) {
   }
   ex.failure = f;
   accounting_.failed_bytes(ex.descriptor.element_byte_count());
+  close_accounting_unlocked(ex, false);
 }
 
 void Runtime::abort_collective(ExecutionId e) {
   std::lock_guard<std::mutex> l(mu_);
   auto& ex = require(e);
   ex.lifecycle.transition_to(CollectiveState::ABORTED);
-  accounting_.collective_aborted();
+  // Only a collective that was reserved holds accounting to close; one that
+  // never started must not close another collective's.
+  close_accounting_unlocked(ex, true);
 }
 
 void Runtime::cancel_collective(ExecutionId e) {
   std::lock_guard<std::mutex> l(mu_);
   auto& ex = require(e);
   ex.lifecycle.transition_to(CollectiveState::CANCELLED);
+  close_accounting_unlocked(ex, false);
 }
 
 void Runtime::mark_stale_collective(ExecutionId e) {
@@ -279,7 +317,9 @@ const CollectiveMeasurement* Runtime::measurement(MeasurementId id) const {
 
 void Runtime::update_health(HealthRecord h) {
   std::lock_guard<std::mutex> l(mu_);
-  if (!health_.is_zero() && compare_generations(h.generation, health_.generation) == std::partial_ordering::less) {
+  // The generation alone decides staleness: a recorded UNKNOWN state at a newer
+  // generation is still newer than an older report.
+  if (compare_generations(h.generation, health_.generation) == std::partial_ordering::less) {
     accounting_.stale_message_rejected();
     throw Error(ErrorCode::STALE_AUTHORITY, "old health report rejected");
   }
@@ -316,7 +356,11 @@ const Runtime::Execution& Runtime::require(ExecutionId e) const {
 
 void Runtime::apply_quorum_unlocked(Execution& ex) {
   const auto* grp = find_group_unlocked(ex.descriptor.group_id(), ex.descriptor.group_generation());
-  if (!grp) { try { ex.lifecycle.transition_to(CollectiveState::FAILED); } catch (const Error&) {} return; }
+  if (!grp) {
+    try { ex.lifecycle.transition_to(CollectiveState::FAILED); } catch (const Error&) {}
+    close_accounting_unlocked(ex, false);
+    return;
+  }
   std::size_t done = 0;
   for (const auto& p : grp->participants()) {
     if (ex.rank_completions.count(p.rank)) ++done;
@@ -324,6 +368,7 @@ void Runtime::apply_quorum_unlocked(Execution& ex) {
   if (done == grp->rank_count()) {
     if (ex.lifecycle.state() == CollectiveState::COMPLETING) {
       try { ex.lifecycle.transition_to(CollectiveState::SUCCEEDED); } catch (const Error&) {}
+      close_accounting_unlocked(ex, false);
     }
   }
 }

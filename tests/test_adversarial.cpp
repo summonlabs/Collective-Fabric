@@ -123,5 +123,96 @@ int main() {
   std::vector<std::uint8_t> no_authority_payload;  // placeholder
   (void)no_authority_payload;
 
+  // ---- regression: accounting closes to zero on every terminal outcome ----
+  {
+    Runtime r2;
+    const CollectiveGroup* g2; const Topology* t2; const BackendCapabilities* c2;
+    set_up(r2, g2, t2, c2);
+    CollectiveDescriptor ok;
+    ok.group_id(CollectiveGroupId(1)).group_generation(GroupGeneration(1)).collective_generation(CollectiveGeneration(1));
+    ok.kind(CollectiveKind::ALL_REDUCE).reduction(ReductionOp::SUM).datatype(Datatype::FLOAT32).element_count(4);
+    ok.collective_id(CollectiveId(7));
+    PlannerInput p2; p2.descriptor=&ok; p2.group=g2; p2.topology=t2; p2.backend=c2;
+    auto launch = [&]() {
+      auto e = r2.create_collective(ok);
+      r2.plan_collective(e, p2); r2.reserve_collective(e); r2.dispatch_collective(e);
+      return e;
+    };
+    auto closed = [&]() {
+      const auto s = r2.accounting().snapshot();
+      return s.reserved_bytes == 0 && s.active_collectives == 0 && s.active_rank_contributions == 0;
+    };
+    std::vector<float> x{1,2,3,4}, y{10,20,30,40};
+    std::vector<std::vector<std::uint8_t>> good;
+    good.push_back(std::vector<std::uint8_t>(reinterpret_cast<std::uint8_t*>(x.data()), reinterpret_cast<std::uint8_t*>(x.data()+4)));
+    good.push_back(std::vector<std::uint8_t>(reinterpret_cast<std::uint8_t*>(y.data()), reinterpret_cast<std::uint8_t*>(y.data()+4)));
+
+    // success
+    auto es = launch();
+    CF_CHECK(r2.accounting().snapshot().reserved_bytes == 16);
+    CF_CHECK(r2.accounting().snapshot().active_collectives == 1);
+    CF_CHECK(r2.accounting().snapshot().active_rank_contributions == 2);
+    CF_CHECK(!r2.execute_collective(es, good).is_null());
+    CF_CHECK(r2.execution_state(es) == CollectiveState::SUCCEEDED);
+    CF_CHECK(closed());
+    // executing the finished collective again changes nothing
+    CF_CHECK(r2.execute_collective(es, good).is_null());
+    CF_CHECK(r2.execution_state(es) == CollectiveState::SUCCEEDED);
+    CF_CHECK(r2.accounting().snapshot().failed_bytes == 0);
+    CF_CHECK(closed());
+
+    // failed execution (wrong input size)
+    auto ef = launch();
+    auto short_inputs = good;
+    short_inputs[1].resize(8);
+    CF_CHECK(r2.execute_collective(ef, short_inputs).is_null());
+    CF_CHECK(r2.execution_state(ef) == CollectiveState::FAILED);
+    CF_CHECK(closed());
+
+    // reported failure, abort and cancel
+    auto e3 = launch();
+    CollectiveFailure cf; cf.class_ = FailureClass::WORKER_DEATH;
+    r2.fail_collective(e3, cf);
+    auto e4 = launch();
+    r2.abort_collective(e4);
+    auto e5 = launch();
+    r2.cancel_collective(e5);
+    CF_CHECK(closed());
+    CF_CHECK(r2.accounting().snapshot().aborted_collectives == 1);
+
+    // aborting a collective that never started leaves a running one's accounting alone
+    auto live = launch();
+    auto idle = r2.create_collective(ok);
+    CF_CHECK_NO_THROW(r2.abort_collective(idle));
+    CF_CHECK(r2.execution_state(idle) == CollectiveState::ABORTED);
+    CF_CHECK(r2.accounting().snapshot().active_collectives == 1);
+    CF_CHECK(r2.accounting().snapshot().aborted_collectives == 1);
+
+    // per-rank completion: validated, reaches quorum, closes the collective
+    CF_CHECK_THROWS(r2.complete_rank(live, RankId(5)));   // not a rank of the group
+    CF_CHECK(r2.execution_state(live) == CollectiveState::DISPATCHED);
+    CF_CHECK_NO_THROW(r2.complete_rank(live, RankId(0)));
+    CF_CHECK(r2.execution_state(live) == CollectiveState::COMPLETING);
+    CF_CHECK_THROWS(r2.complete_rank(live, RankId(0)));   // duplicate
+    CF_CHECK_NO_THROW(r2.complete_rank(live, RankId(1)));
+    CF_CHECK(r2.execution_state(live) == CollectiveState::SUCCEEDED);
+    CF_CHECK(closed());
+    // late completions cannot touch a finished or failed collective
+    CF_CHECK_THROWS(r2.complete_rank(live, RankId(1)));
+    CF_CHECK_THROWS(r2.complete_rank(e3, RankId(0)));
+    CF_CHECK(r2.execution_state(e3) == CollectiveState::FAILED);
+    CF_CHECK(closed());
+
+    // an older health report never overwrites a newer one, whatever its state
+    HealthRecord unknown_new;
+    unknown_new.state = HealthState::UNKNOWN; unknown_new.generation = HealthGeneration(5);
+    r2.update_health(unknown_new);
+    HealthRecord healthy_old;
+    healthy_old.state = HealthState::HEALTHY; healthy_old.generation = HealthGeneration(3);
+    CF_CHECK_THROWS(r2.update_health(healthy_old));
+    CF_CHECK(r2.health_generation() == HealthGeneration(5));
+    CF_CHECK(r2.path_health() == HealthState::UNKNOWN);
+  }
+
   CF_FINISH("test_adversarial");
 }
